@@ -4,7 +4,7 @@
 //  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
 //   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
 //
-//  Copyright © 2016 - 2023 Weaviate B.V. All rights reserved.
+//  Copyright © 2016 - 2024 Weaviate B.V. All rights reserved.
 //
 //  CONTACT: hello@weaviate.io
 //
@@ -13,6 +13,8 @@ package test
 
 import (
 	"context"
+	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -20,18 +22,21 @@ import (
 	pb "github.com/weaviate/weaviate/grpc/generated/protocol/v1"
 	"github.com/weaviate/weaviate/test/helper"
 	"github.com/weaviate/weaviate/test/helper/sample-schema/books"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/health/grpc_health_v1"
 )
 
-func TestGRPC(t *testing.T) {
-	conn, err := helper.CreateGrpcConnectionClient(":50051")
-	require.NoError(t, err)
-	require.NotNil(t, conn)
-	grpcClient := helper.CreateGrpcWeaviateClient(conn)
-	require.NotNil(t, grpcClient)
+func idByte(id string) []byte {
+	hexInteger, _ := new(big.Int).SetString(strings.Replace(id, "-", "", -1), 16)
+	return hexInteger.Bytes()
+}
 
-	// create Books class
+func TestGRPC(t *testing.T) {
+	grpcClient, conn := newClient(t)
+
+	// delete if exists and then re-create Books class
 	booksClass := books.ClassContextionaryVectorizer()
+	helper.DeleteClass(t, booksClass.Class)
 	helper.CreateClass(t, booksClass)
 	defer helper.DeleteClass(t, booksClass.Class)
 
@@ -82,12 +87,17 @@ func TestGRPC(t *testing.T) {
 				Metadata: &pb.MetadataRequest{
 					Uuid: true,
 				},
+				Uses_123Api: true,
 			},
 		},
 		{
 			name: "Search without props",
 			req: &pb.SearchRequest{
 				Collection: booksClass.Class,
+				Metadata: &pb.MetadataRequest{
+					Uuid: true,
+				},
+				Uses_123Api: true,
 			},
 		},
 	}
@@ -104,26 +114,51 @@ func TestGRPC(t *testing.T) {
 				id := res.Metadata.Id
 
 				assert.True(t, id == books.Dune.String() || id == books.ProjectHailMary.String() || id == books.TheLordOfTheIceGarden.String())
-				title, ok := res.Properties.NonRefProperties.AsMap()["title"]
-				require.True(t, ok)
+				titleRaw := res.Properties.NonRefProps.Fields["title"]
+				require.NotNil(t, titleRaw)
+				title := titleRaw.GetStringValue()
+				require.NotNil(t, title)
 
-				objProps := res.Properties.ObjectProperties
-				require.Len(t, objProps, 1)
-				isbn, ok := objProps[0].Value.NonRefProperties.AsMap()["isbn"]
-				require.True(t, ok)
+				metaRaw := res.Properties.NonRefProps.Fields["meta"]
+				require.NotNil(t, metaRaw)
+				meta := metaRaw.GetObjectValue()
+				require.NotNil(t, meta)
+				isbnRaw := meta.GetFields()["isbn"]
+				require.NotNil(t, isbnRaw)
+				isbn := isbnRaw.GetStringValue()
+				require.NotNil(t, isbn)
 
-				nestedObjProps := objProps[0].Value.ObjectProperties
-				require.Len(t, nestedObjProps, 1)
-				nestedObj := nestedObjProps[0].Value.NonRefProperties.AsMap()
+				objRaw := meta.GetFields()["obj"]
+				require.NotNil(t, objRaw)
+				obj := objRaw.GetObjectValue()
+				require.NotNil(t, obj)
 
-				nestedObjArrayProps := objProps[0].Value.ObjectArrayProperties
-				require.Len(t, nestedObjArrayProps, 1)
-				nestedObjEntry := nestedObjArrayProps[0].Values[0].NonRefProperties.AsMap()
+				objsRaw := meta.GetFields()["objs"]
+				require.NotNil(t, objsRaw)
+				objs := objsRaw.GetListValue()
+				require.NotNil(t, objs)
 
-				objArrayProps := res.Properties.ObjectArrayProperties
-				require.Len(t, objArrayProps, 1)
-				tags := objArrayProps[0].Values[0].TextArrayProperties[0].Values
-				require.True(t, ok)
+				objEntryRaw := objs.Values[0]
+				require.NotNil(t, objEntryRaw)
+				objEntry := objEntryRaw.GetObjectValue()
+				require.NotNil(t, objEntry)
+
+				reviewsRaw := res.Properties.NonRefProps.Fields["reviews"]
+				require.NotNil(t, reviewsRaw)
+				reviews := reviewsRaw.GetListValue()
+				require.NotNil(t, reviews)
+				require.Len(t, reviews.Values, 1)
+
+				review := reviews.Values[0].GetObjectValue()
+				require.NotNil(t, review)
+
+				tags := review.Fields["tags"].GetListValue()
+				require.NotNil(t, tags)
+
+				strTags := make([]string, len(tags.Values))
+				for i, tag := range tags.Values {
+					strTags[i] = tag.GetStringValue()
+				}
 
 				expectedTitle := ""
 				expectedIsbn := ""
@@ -145,15 +180,45 @@ func TestGRPC(t *testing.T) {
 				}
 				assert.Equal(t, expectedTitle, title)
 				assert.Equal(t, expectedIsbn, isbn)
-				assert.Equal(t, expectedTags, tags)
-				assert.Equal(t, map[string]interface{}{"text": "some text"}, nestedObj)
-				assert.Equal(t, map[string]interface{}{"text": "some text"}, nestedObjEntry)
+				assert.Equal(t, expectedTags, strTags)
+
+				expectedObj := &pb.Properties{
+					Fields: map[string]*pb.Value{
+						"text": {Kind: &pb.Value_StringValue{StringValue: "some text"}},
+					},
+				}
+				assert.Equal(t, expectedObj, obj)
+				assert.Equal(t, expectedObj, objEntry)
 			}
 		})
 	}
+
+	t.Run("Batch delete", func(t *testing.T) {
+		resp, err := grpcClient.BatchDelete(context.TODO(), &pb.BatchDeleteRequest{
+			Collection: "Books",
+			Filters:    &pb.Filters{Operator: pb.Filters_OPERATOR_EQUAL, TestValue: &pb.Filters_ValueText{ValueText: "Dune"}, Target: &pb.FilterTarget{Target: &pb.FilterTarget_Property{Property: "title"}}},
+			DryRun:     true,
+			Verbose:    true,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		require.Equal(t, resp.Matches, int64(1))
+		require.Equal(t, resp.Successful, int64(1))
+		require.Equal(t, resp.Failed, int64(0))
+		require.Equal(t, resp.Objects[0].Uuid, idByte(books.Dune.String()))
+	})
 
 	t.Run("gRPC Search removed", func(t *testing.T) {
 		_, err := grpcClient.Search(context.TODO(), &pb.SearchRequest{})
 		require.NotNil(t, err)
 	})
+}
+
+func newClient(t *testing.T) (pb.WeaviateClient, *grpc.ClientConn) {
+	conn, err := helper.CreateGrpcConnectionClient(":50051")
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	grpcClient := helper.CreateGrpcWeaviateClient(conn)
+	require.NotNil(t, grpcClient)
+	return grpcClient, conn
 }

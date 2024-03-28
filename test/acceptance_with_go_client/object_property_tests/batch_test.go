@@ -4,7 +4,7 @@
 //  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
 //   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
 //
-//  Copyright © 2016 - 2023 Weaviate B.V. All rights reserved.
+//  Copyright © 2016 - 2024 Weaviate B.V. All rights reserved.
 //
 //  CONTACT: hello@weaviate.io
 //
@@ -35,12 +35,12 @@ func TestObjectProperty_Batch(t *testing.T) {
 		config wvt.Config
 	}{
 		{
-			name:   "rest api",
+			name:   "single node - rest api",
 			config: wvt.Config{Scheme: "http", Host: "localhost:8080"},
 		},
 		{
-			name:   "grpc api",
-			config: wvt.Config{Scheme: "http", Host: "localhost:8080", GrpcConfig: grpc.Config{Enabled: true, Host: "localhost:50051"}},
+			name:   "single node - grpc api",
+			config: wvt.Config{Scheme: "http", Host: "localhost:8080", GrpcConfig: &grpc.Config{Host: "localhost:50051"}},
 		},
 	}
 	for _, tt := range tests {

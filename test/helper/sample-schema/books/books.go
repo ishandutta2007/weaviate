@@ -4,7 +4,7 @@
 //  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
 //   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
 //
-//  Copyright © 2016 - 2023 Weaviate B.V. All rights reserved.
+//  Copyright © 2016 - 2024 Weaviate B.V. All rights reserved.
 //
 //  CONTACT: hello@weaviate.io
 //
@@ -29,6 +29,39 @@ const (
 
 func ClassContextionaryVectorizer() *models.Class {
 	return class(defaultClassName, "text2vec-contextionary")
+}
+
+func ClassNamedContextionaryVectorizer() *models.Class {
+	vc := map[string]models.VectorConfig{
+		"all": {
+			Vectorizer: map[string]interface{}{
+				"text2vec-contextionary": map[string]interface{}{
+					"vectorizeClassName": false,
+				},
+			},
+			VectorIndexType: "hnsw",
+		},
+		"title": {
+			Vectorizer: map[string]interface{}{
+				"text2vec-contextionary": map[string]interface{}{
+					"vectorizeClassName": false,
+					"properties":         []string{"title"},
+				},
+			},
+			VectorIndexType: "hnsw",
+		},
+		"description": {
+			Vectorizer: map[string]interface{}{
+				"text2vec-contextionary": map[string]interface{}{
+					"vectorizeClassName": false,
+					"properties":         []string{"description"},
+				},
+			},
+			VectorIndexType: "hnsw",
+		},
+	}
+
+	return classNamedVectors(defaultClassName, vc)
 }
 
 func ClassContextionaryVectorizerWithName(className string) *models.Class {
@@ -63,17 +96,37 @@ func ClassCLIPVectorizer() *models.Class {
 	return c
 }
 
+func ClassBindVectorizer() *models.Class {
+	c := class(defaultClassName, "multi2vec-bind")
+	c.ModuleConfig.(map[string]interface{})["multi2vec-bind"] = map[string]interface{}{
+		"textFields": []string{"title", "tags", "description"},
+	}
+	return c
+}
+
+func classNamedVectors(className string, vectorConfig map[string]models.VectorConfig, additionalModules ...string) *models.Class {
+	return classBase(className, "", vectorConfig, additionalModules...)
+}
+
 func class(className, vectorizer string, additionalModules ...string) *models.Class {
-	moduleConfig := map[string]interface{}{
-		vectorizer: map[string]interface{}{
+	return classBase(className, vectorizer, nil, additionalModules...)
+}
+
+func classBase(className, vectorizer string, vectorConfig map[string]models.VectorConfig, additionalModules ...string) *models.Class {
+	moduleConfig := map[string]interface{}{}
+	propModuleConfig := map[string]interface{}{}
+	if vectorizer != "" {
+		moduleConfig[vectorizer] = map[string]interface{}{
 			"vectorizeClassName": true,
-		},
+		}
+		propModuleConfig[vectorizer] = map[string]interface{}{"skip": false}
 	}
 	if len(additionalModules) > 0 {
 		for _, module := range additionalModules {
 			moduleConfig[module] = map[string]interface{}{}
 		}
 	}
+
 	return &models.Class{
 		Class:        className,
 		Vectorizer:   vectorizer,
@@ -83,24 +136,25 @@ func class(className, vectorizer string, additionalModules ...string) *models.Cl
 			IndexTimestamps:     true,
 			IndexPropertyLength: true,
 		},
+		VectorConfig: vectorConfig,
 		Properties: []*models.Property{
 			{
 				Name:         "title",
 				DataType:     schema.DataTypeText.PropString(),
 				Tokenization: models.PropertyTokenizationWhitespace,
-				ModuleConfig: map[string]interface{}{vectorizer: map[string]interface{}{"skip": false}},
+				ModuleConfig: propModuleConfig,
 			},
 			{
 				Name:         "tags",
 				DataType:     schema.DataTypeTextArray.PropString(),
 				Tokenization: models.PropertyTokenizationWhitespace,
-				ModuleConfig: map[string]interface{}{vectorizer: map[string]interface{}{"skip": false}},
+				ModuleConfig: propModuleConfig,
 			},
 			{
 				Name:         "description",
 				DataType:     schema.DataTypeText.PropString(),
 				Tokenization: models.PropertyTokenizationWhitespace,
-				ModuleConfig: map[string]interface{}{vectorizer: map[string]interface{}{"skip": false}},
+				ModuleConfig: propModuleConfig,
 			},
 			{
 				Name: "meta", DataType: schema.DataTypeObject.PropString(),

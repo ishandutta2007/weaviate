@@ -4,7 +4,7 @@
 //  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
 //   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
 //
-//  Copyright © 2016 - 2023 Weaviate B.V. All rights reserved.
+//  Copyright © 2016 - 2024 Weaviate B.V. All rights reserved.
 //
 //  CONTACT: hello@weaviate.io
 //
@@ -29,6 +29,7 @@ func TestGRPCBatchRequest(t *testing.T) {
 	collection := "TestClass"
 	refClass1 := "OtherClass"
 	refClass2 := "AnotherClass"
+	multiVecClass := "MultiVec"
 	scheme := schema.Schema{
 		Objects: &models.Schema{
 			Classes: []*models.Class{
@@ -53,6 +54,22 @@ func TestGRPCBatchRequest(t *testing.T) {
 					Properties: []*models.Property{
 						{Name: "else", DataType: schema.DataTypeText.PropString()},
 						{Name: "ref3", DataType: []string{refClass2}},
+					},
+				},
+				{
+					Class: multiVecClass,
+					Properties: []*models.Property{
+						{Name: "first", DataType: schema.DataTypeText.PropString()},
+					},
+					VectorConfig: map[string]models.VectorConfig{
+						"custom": {
+							VectorIndexType: "hnsw",
+							Vectorizer:      map[string]interface{}{"none": map[string]interface{}{}},
+						},
+						"first": {
+							VectorIndexType: "flat",
+							Vectorizer:      map[string]interface{}{"text2vec-contextionary": map[string]interface{}{}},
+						},
 					},
 				},
 			},
@@ -104,6 +121,21 @@ func TestGRPCBatchRequest(t *testing.T) {
 					map[string]interface{}{"beacon": BEACON_START + refClass1 + "/" + UUID4},
 				},
 			}}},
+		},
+		{
+			name: "Named Vecs",
+			req: []*pb.BatchObject{{Collection: collection, Uuid: UUID4, Vectors: []*pb.Vectors{
+				{
+					Name:        "custom",
+					VectorBytes: byteVector([]float32{0.1, 0.2, 0.3}),
+				},
+			}}},
+			out: []*models.Object{{
+				Class: collection, ID: UUID4, Properties: nilMap,
+				Vectors: map[string]models.Vector{
+					"custom": []float32{0.1, 0.2, 0.3},
+				},
+			}},
 		},
 		{
 			name: "only mult ref",
@@ -183,6 +215,7 @@ func TestGRPCBatchRequest(t *testing.T) {
 				TextArrayProperties: []*pb.TextArrayProperties{
 					{PropName: "text1", Values: []string{"first", "second"}}, {PropName: "text2", Values: []string{"third"}},
 				},
+				EmptyListProps: []string{"text3"},
 			}}},
 			out: []*models.Object{{Class: collection, ID: UUID4, Properties: map[string]interface{}{
 				"name":       "something",
@@ -194,6 +227,7 @@ func TestGRPCBatchRequest(t *testing.T) {
 				"float2":     []interface{}{4., 5.},
 				"text1":      []interface{}{"first", "second"},
 				"text2":      []interface{}{"third"},
+				"text3":      []interface{}{},
 			}}},
 		},
 		{
@@ -210,6 +244,7 @@ func TestGRPCBatchRequest(t *testing.T) {
 							ObjectProperties: []*pb.ObjectProperties{{
 								PropName: "obj", Value: &pb.ObjectPropertiesValue{
 									NonRefProperties: newStruct(t, map[string]interface{}{"name": "something"}),
+									EmptyListProps:   []string{"empty"},
 								},
 							}},
 						},
@@ -219,7 +254,7 @@ func TestGRPCBatchRequest(t *testing.T) {
 			out: []*models.Object{{Class: collection, ID: UUID4, Properties: map[string]interface{}{
 				"simpleObj": map[string]interface{}{"name": "something"},
 				"nestedObj": map[string]interface{}{
-					"obj": map[string]interface{}{"name": "something"},
+					"obj": map[string]interface{}{"name": "something", "empty": []interface{}{}},
 				},
 			}}},
 		},

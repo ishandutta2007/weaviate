@@ -4,7 +4,7 @@
 //  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
 //   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
 //
-//  Copyright © 2016 - 2023 Weaviate B.V. All rights reserved.
+//  Copyright © 2016 - 2024 Weaviate B.V. All rights reserved.
 //
 //  CONTACT: hello@weaviate.io
 //
@@ -45,15 +45,16 @@ const (
 )
 
 func backupJourney(t *testing.T, className, backend, backupID string,
-	journeyType journeyType, dataIntegrityCheck dataIntegrityCheck, tenantNames []string,
+	journeyType journeyType, dataIntegrityCheck dataIntegrityCheck,
+	tenantNames []string, pqEnabled bool,
 ) {
 	if journeyType == clusterJourney && backend == "filesystem" {
 		t.Run("should fail backup/restore with local filesystem backend", func(t *testing.T) {
-			backupResp, err := helper.CreateBackup(t, className, backend, backupID)
+			backupResp, err := helper.CreateBackup(t, helper.DefaultBackupConfig(), className, backend, backupID)
 			assert.Nil(t, backupResp)
 			assert.Error(t, err)
 
-			restoreResp, err := helper.RestoreBackup(t, className, backend, backupID, map[string]string{})
+			restoreResp, err := helper.RestoreBackup(t, helper.DefaultRestoreConfig(), className, backend, backupID, map[string]string{})
 			assert.Nil(t, restoreResp)
 			assert.Error(t, err)
 		})
@@ -61,7 +62,7 @@ func backupJourney(t *testing.T, className, backend, backupID string,
 	}
 
 	t.Run("create backup", func(t *testing.T) {
-		resp, err := helper.CreateBackup(t, className, backend, backupID)
+		resp, err := helper.CreateBackup(t, helper.DefaultBackupConfig(), className, backend, backupID)
 		helper.AssertRequestOk(t, resp, err, nil)
 		// wait for create success
 		createTime := time.Now()
@@ -90,7 +91,8 @@ func backupJourney(t *testing.T, className, backend, backupID string,
 			require.NotNil(t, statusResp.Payload.Status)
 		})
 
-		require.Equal(t, *statusResp.Payload.Status, string(backup.Success))
+		require.Equal(t, *statusResp.Payload.Status,
+			string(backup.Success), statusResp.Payload.Error)
 	})
 
 	t.Run("delete class for restoration", func(t *testing.T) {
@@ -98,7 +100,7 @@ func backupJourney(t *testing.T, className, backend, backupID string,
 	})
 
 	t.Run("restore backup", func(t *testing.T) {
-		_, err := helper.RestoreBackup(t, className, backend, backupID, map[string]string{})
+		_, err := helper.RestoreBackup(t, helper.DefaultRestoreConfig(), className, backend, backupID, map[string]string{})
 		require.Nil(t, err, "expected nil, got: %v", err)
 
 		// wait for restore success
@@ -146,6 +148,9 @@ func backupJourney(t *testing.T, className, backend, backupID string,
 		if dataIntegrityCheck == checkClassAndDataPresence {
 			count := moduleshelper.GetClassCount(t, className, singleTenant)
 			assert.Equal(t, int64(500), count)
+			if pqEnabled {
+				moduleshelper.EnsureCompressedVectorsRestored(t, className)
+			}
 		}
 	}
 }
@@ -153,7 +158,7 @@ func backupJourney(t *testing.T, className, backend, backupID string,
 func nodeMappingBackupJourney_Backup(t *testing.T, className, backend, backupID string, tenantNames []string,
 ) {
 	t.Run("create backup", func(t *testing.T) {
-		resp, err := helper.CreateBackup(t, className, backend, backupID)
+		resp, err := helper.CreateBackup(t, helper.DefaultBackupConfig(), className, backend, backupID)
 		helper.AssertRequestOk(t, resp, err, nil)
 		// wait for create success
 		createTime := time.Now()
@@ -188,7 +193,7 @@ func nodeMappingBackupJourney_Backup(t *testing.T, className, backend, backupID 
 
 func nodeMappingBackupJourney_Restore(t *testing.T, className, backend, backupID string, tenantNames []string, nodeMapping map[string]string) {
 	t.Run("restore backup", func(t *testing.T) {
-		_, err := helper.RestoreBackup(t, className, backend, backupID, nodeMapping)
+		_, err := helper.RestoreBackup(t, helper.DefaultRestoreConfig(), className, backend, backupID, nodeMapping)
 		require.Nil(t, err, "expected nil, got: %v", err)
 
 		// wait for restore success

@@ -4,7 +4,7 @@
 //  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
 //   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
 //
-//  Copyright © 2016 - 2023 Weaviate B.V. All rights reserved.
+//  Copyright © 2016 - 2024 Weaviate B.V. All rights reserved.
 //
 //  CONTACT: hello@weaviate.io
 //
@@ -16,6 +16,7 @@ import (
 
 	"github.com/go-openapi/strfmt"
 	"github.com/google/uuid"
+	"github.com/weaviate/weaviate/usecases/byteops"
 
 	"github.com/weaviate/weaviate/entities/models"
 	"github.com/weaviate/weaviate/entities/schema"
@@ -51,6 +52,7 @@ func batchFromProto(req *pb.BatchObjectsRequest, scheme schema.Schema) ([]*model
 				IntArrayProperties:     obj.Properties.IntArrayProperties,
 				ObjectProperties:       obj.Properties.ObjectProperties,
 				ObjectArrayProperties:  obj.Properties.ObjectArrayProperties,
+				EmptyListProps:         obj.Properties.EmptyListProps,
 			})
 			if err := extractSingleRefTarget(class, obj.Properties.SingleTargetRefProps, props); err != nil {
 				objectErrors[i] = err
@@ -67,13 +69,31 @@ func batchFromProto(req *pb.BatchObjectsRequest, scheme schema.Schema) ([]*model
 			objectErrors[i] = err
 			continue
 		}
+
+		var vector []float32 = nil
+		// bytes vector has precedent for being more efficient
+		if len(obj.VectorBytes) > 0 {
+			vector = byteops.Float32FromByteVector(obj.VectorBytes)
+		} else if len(obj.Vector) > 0 {
+			vector = obj.Vector
+		}
+
+		var vectors models.Vectors = nil
+		if len(obj.Vectors) > 0 {
+			vectors = make(models.Vectors, len(obj.Vectors))
+			for _, vec := range obj.Vectors {
+				vectors[vec.Name] = byteops.Float32FromByteVector(vec.VectorBytes)
+			}
+		}
+
 		objOriginalIndex[insertCounter] = i
 		objs = append(objs, &models.Object{
 			Class:      obj.Collection,
 			Tenant:     obj.Tenant,
-			Vector:     obj.Vector,
+			Vector:     vector,
 			Properties: props,
 			ID:         strfmt.UUID(obj.Uuid),
+			Vectors:    vectors,
 		})
 		insertCounter += 1
 	}
@@ -111,8 +131,8 @@ func extractMultiRefTarget(class *models.Class, properties []*pb.BatchObject_Mul
 			return fmt.Errorf("target is a single-target reference, need multi-target %v", prop.DataType)
 		}
 		beacons := make([]interface{}, len(refMulti.Uuids))
-		for j, uuid := range refMulti.Uuids {
-			beacons[j] = map[string]interface{}{"beacon": BEACON_START + refMulti.TargetCollection + "/" + uuid}
+		for j, uid := range refMulti.Uuids {
+			beacons[j] = map[string]interface{}{"beacon": BEACON_START + refMulti.TargetCollection + "/" + uid}
 		}
 		props[propName] = beacons
 	}
@@ -128,49 +148,46 @@ func extractPrimitiveProperties(properties *pb.ObjectPropertiesValue) map[string
 	}
 
 	// arrays cannot be part of a GRPC map, so we need to handle each type separately
-	if properties.BooleanArrayProperties != nil {
-		for j := range properties.BooleanArrayProperties {
-			props[properties.BooleanArrayProperties[j].PropName] = sliceToInterface(properties.BooleanArrayProperties[j].Values)
+	for j := range properties.BooleanArrayProperties {
+		props[properties.BooleanArrayProperties[j].PropName] = sliceToInterface(properties.BooleanArrayProperties[j].Values)
+	}
+
+	for j := range properties.NumberArrayProperties {
+		inputValuesBytes := properties.NumberArrayProperties[j].ValuesBytes
+		var values []float64
+
+		if len(inputValuesBytes) > 0 {
+			values = byteops.Float64FromByteVector(inputValuesBytes)
+		} else {
+			values = properties.NumberArrayProperties[j].Values
 		}
+
+		props[properties.NumberArrayProperties[j].PropName] = sliceToInterface(values)
 	}
 
-	if properties.NumberArrayProperties != nil {
-		for j := range properties.NumberArrayProperties {
-			props[properties.NumberArrayProperties[j].PropName] = sliceToInterface(properties.NumberArrayProperties[j].Values)
-		}
+	for j := range properties.TextArrayProperties {
+		props[properties.TextArrayProperties[j].PropName] = sliceToInterface(properties.TextArrayProperties[j].Values)
 	}
 
-	if properties.TextArrayProperties != nil {
-		for j := range properties.TextArrayProperties {
-			props[properties.TextArrayProperties[j].PropName] = sliceToInterface(properties.TextArrayProperties[j].Values)
-		}
+	for j := range properties.IntArrayProperties {
+		props[properties.IntArrayProperties[j].PropName] = sliceToInterface(properties.IntArrayProperties[j].Values)
 	}
 
-	if properties.IntArrayProperties != nil {
-		for j := range properties.IntArrayProperties {
-			props[properties.IntArrayProperties[j].PropName] = sliceToInterface(properties.IntArrayProperties[j].Values)
-		}
+	for j := range properties.ObjectProperties {
+		props[properties.ObjectProperties[j].PropName] = extractPrimitiveProperties(properties.ObjectProperties[j].Value)
 	}
 
-	if properties.ObjectProperties != nil {
-		for j := range properties.ObjectProperties {
-			props[properties.ObjectProperties[j].PropName] = extractPrimitiveProperties(properties.ObjectProperties[j].Value)
-		}
-	}
-
-	if properties.ObjectArrayProperties != nil {
-		extractObjectArray(properties.ObjectArrayProperties, props)
-	}
-
-	return props
-}
-
-func extractObjectArray(propsArr []*pb.ObjectArrayProperties, props map[string]interface{}) {
-	for _, prop := range propsArr {
+	for _, prop := range properties.ObjectArrayProperties {
 		nested := make([]interface{}, len(prop.Values))
 		for k := range prop.Values {
 			nested[k] = extractPrimitiveProperties(prop.Values[k])
 		}
 		props[prop.PropName] = nested
 	}
+
+	for _, propName := range properties.EmptyListProps {
+		props[propName] = []interface{}{}
+	}
+
+	return props
 }

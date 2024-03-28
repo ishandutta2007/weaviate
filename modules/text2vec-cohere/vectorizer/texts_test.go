@@ -4,7 +4,7 @@
 //  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
 //   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
 //
-//  Copyright © 2016 - 2023 Weaviate B.V. All rights reserved.
+//  Copyright © 2016 - 2024 Weaviate B.V. All rights reserved.
 //
 //  CONTACT: hello@weaviate.io
 //
@@ -15,12 +15,17 @@ import (
 	"context"
 	"testing"
 
+	"github.com/sirupsen/logrus/hooks/test"
+	"github.com/weaviate/weaviate/modules/text2vec-cohere/ent"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // as used in the nearText searcher
 func TestVectorizingTexts(t *testing.T) {
+	logger, _ := test.NewNullLogger()
+
 	type testCase struct {
 		name                string
 		input               []string
@@ -77,9 +82,9 @@ func TestVectorizingTexts(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			client := &fakeClient{}
 
-			v := New(client)
+			v := New(client, logger)
 
-			settings := &fakeSettings{
+			settings := &fakeClassConfig{
 				cohereModel: test.cohereModel,
 			}
 			vec, err := v.Texts(context.Background(), test.input, settings)
@@ -87,7 +92,9 @@ func TestVectorizingTexts(t *testing.T) {
 			require.Nil(t, err)
 			assert.Equal(t, []float32{0.1, 1.1, 2.1, 3.1}, vec)
 			assert.Equal(t, test.input, client.lastInput)
-			assert.Equal(t, test.expectedCohereModel, client.lastConfig.Model)
+			conf := ent.NewClassSettings(client.lastConfig)
+
+			assert.Equal(t, test.expectedCohereModel, conf.Model())
 		})
 	}
 }

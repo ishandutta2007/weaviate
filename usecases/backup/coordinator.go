@@ -4,7 +4,7 @@
 //  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
 //   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
 //
-//  Copyright © 2016 - 2023 Weaviate B.V. All rights reserved.
+//  Copyright © 2016 - 2024 Weaviate B.V. All rights reserved.
 //
 //  CONTACT: hello@weaviate.io
 //
@@ -15,14 +15,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	enterrors "github.com/weaviate/weaviate/entities/errors"
+
 	"github.com/sirupsen/logrus"
 	"github.com/weaviate/weaviate/entities/backup"
 	"github.com/weaviate/weaviate/usecases/config"
-	"golang.org/x/sync/errgroup"
 )
 
 // Op is the kind of a backup operation
@@ -34,7 +36,7 @@ const (
 )
 
 var (
-	errNoShardFound = errors.New("no shard found")
+	// errNoShardFound = errors.New("no shard found")
 	errCannotCommit = errors.New("cannot commit")
 	errMetaNotFound = errors.New("metadata not found")
 	errUnknownOp    = errors.New("unknown backup operation")
@@ -126,6 +128,7 @@ func newCoordinator(
 
 // Backup coordinates a distributed backup among participants
 func (c *coordinator) Backup(ctx context.Context, store coordStore, req *Request) error {
+	req.Method = OpCreate
 	groups, err := c.groupByShard(ctx, req.Classes)
 	if err != nil {
 		return err
@@ -148,7 +151,7 @@ func (c *coordinator) Backup(ctx context.Context, store coordStore, req *Request
 		delete(c.Participants, key)
 	}
 
-	nodes, err := c.canCommit(ctx, OpCreate, req.Backend)
+	nodes, err := c.canCommit(ctx, req)
 	if err != nil {
 		c.lastOp.reset()
 		return err
@@ -165,15 +168,21 @@ func (c *coordinator) Backup(ctx context.Context, store coordStore, req *Request
 		Backend: req.Backend,
 	}
 
-	go func() {
+	f := func() {
 		defer c.lastOp.reset()
 		ctx := context.Background()
 		c.commit(ctx, &statusReq, nodes, false)
+		logFields := logrus.Fields{"action": OpCreate, "backup_id": req.ID}
 		if err := store.PutMeta(ctx, GlobalBackupFile, c.descriptor); err != nil {
-			c.log.WithField("action", OpCreate).
-				WithField("backup_id", req.ID).Errorf("put_meta: %v", err)
+			c.log.WithFields(logFields).Errorf("coordinator: put_meta: %v", err)
 		}
-	}()
+		if c.descriptor.Status == backup.Success {
+			c.log.WithFields(logFields).Info("coordinator: backup completed successfully")
+		} else {
+			c.log.WithFields(logFields).Errorf("coordinator: %s", c.descriptor.Error)
+		}
+	}
+	enterrors.GoWrapper(f, c.log)
 
 	return nil
 }
@@ -182,9 +191,10 @@ func (c *coordinator) Backup(ctx context.Context, store coordStore, req *Request
 func (c *coordinator) Restore(
 	ctx context.Context,
 	store coordStore,
-	backend string,
+	req *Request,
 	desc *backup.DistributedBackupDescriptor,
 ) error {
+	req.Method = OpRestore
 	// make sure there is no active backup
 	if prevID := c.lastOp.renew(desc.ID, store.HomeDir()); prevID != "" {
 		return fmt.Errorf("restoration %s already in progress", prevID)
@@ -195,7 +205,7 @@ func (c *coordinator) Restore(
 	}
 	c.descriptor = desc.ResetStatus()
 
-	nodes, err := c.canCommit(ctx, OpRestore, backend)
+	nodes, err := c.canCommit(ctx, req)
 	if err != nil {
 		c.lastOp.reset()
 		return err
@@ -204,20 +214,27 @@ func (c *coordinator) Restore(
 	// initial put so restore status is immediately available
 	if err := store.PutMeta(ctx, GlobalRestoreFile, c.descriptor); err != nil {
 		c.lastOp.reset()
-		req := &AbortRequest{Method: OpRestore, ID: desc.ID, Backend: backend}
+		req := &AbortRequest{Method: OpRestore, ID: desc.ID, Backend: req.Backend}
 		c.abortAll(ctx, req, nodes)
 		return fmt.Errorf("put initial metadata: %w", err)
 	}
 
-	statusReq := StatusRequest{Method: OpRestore, ID: desc.ID, Backend: backend}
-	go func() {
+	statusReq := StatusRequest{Method: OpRestore, ID: desc.ID, Backend: req.Backend}
+	g := func() {
 		defer c.lastOp.reset()
 		ctx := context.Background()
 		c.commit(ctx, &statusReq, nodes, true)
+		logFields := logrus.Fields{"action": OpRestore, "backup_id": desc.ID}
 		if err := store.PutMeta(ctx, GlobalRestoreFile, c.descriptor); err != nil {
-			c.log.WithField("action", OpRestore).WithField("backup_id", desc.ID).Errorf("put_meta: %v", err)
+			c.log.WithFields(logFields).Errorf("coordinator: put_meta: %v", err)
 		}
-	}()
+		if c.descriptor.Status == backup.Success {
+			c.log.WithFields(logFields).Info("coordinator: backup restored successfully")
+		} else {
+			c.log.WithFields(logFields).Errorf("coordinator: %v", c.descriptor.Error)
+		}
+	}
+	enterrors.GoWrapper(g, c.log)
 
 	return nil
 }
@@ -250,7 +267,7 @@ func (c *coordinator) OnStatus(ctx context.Context, store coordStore, req *Statu
 
 // canCommit asks candidates if they agree to participate in DBRO
 // It returns and error if any candidates refuses to participate
-func (c *coordinator) canCommit(ctx context.Context, method Op, backend string) (map[string]string, error) {
+func (c *coordinator) canCommit(ctx context.Context, req *Request) (map[string]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeoutCanCommit)
 	defer cancel()
 
@@ -267,7 +284,7 @@ func (c *coordinator) canCommit(ctx context.Context, method Op, backend string) 
 	nodeMapping := c.descriptor.NodeMapping
 	groups := c.descriptor.Nodes
 
-	g, ctx := errgroup.WithContext(ctx)
+	g, ctx := enterrors.NewErrorGroupWithContextWrapper(c.log, ctx)
 	g.SetLimit(_MaxNumberConns)
 	reqChan := make(chan pair)
 	g.Go(func() error {
@@ -290,12 +307,13 @@ func (c *coordinator) canCommit(ctx context.Context, method Op, backend string) 
 			reqChan <- pair{
 				nodeHost{node, host},
 				&Request{
-					Method:      method,
+					Method:      req.Method,
 					ID:          id,
-					Backend:     backend,
+					Backend:     req.Backend,
 					Classes:     gr.Classes,
-					NodeMapping: nodeMapping,
 					Duration:    _BookingPeriod,
+					NodeMapping: nodeMapping,
+					Compression: req.Compression,
 				},
 			}
 		}
@@ -320,9 +338,9 @@ func (c *coordinator) canCommit(ctx context.Context, method Op, backend string) 
 			return nil
 		})
 	}
-	req := &AbortRequest{Method: method, ID: id, Backend: backend}
+	abortReq := &AbortRequest{Method: req.Method, ID: id, Backend: req.Backend}
 	if err := g.Wait(); err != nil {
-		c.abortAll(ctx, req, nodes)
+		c.abortAll(ctx, abortReq, nodes)
 		return nil, err
 	}
 	return nodes, nil
@@ -378,7 +396,7 @@ func (c *coordinator) queryAll(ctx context.Context, req *StatusRequest, nodes ma
 	defer cancel()
 
 	rs := make([]partialStatus, len(nodes))
-	g, ctx := errgroup.WithContext(ctx)
+	g, ctx := enterrors.NewErrorGroupWithContextWrapper(c.log, ctx)
 	g.SetLimit(_MaxNumberConns)
 	i := 0
 	for node, hostname := range nodes {
@@ -407,7 +425,7 @@ func (c *coordinator) queryAll(ctx context.Context, req *StatusRequest, nodes ma
 		} else if now.Sub(st.LastTime) > c.timeoutNodeDown {
 			n++
 			st.Status = backup.Failed
-			st.Reason = "might be down:" + r.err.Error()
+			st.Reason = fmt.Sprintf("node %q might be down: %v", r.node, r.err.Error())
 			delete(nodes, r.node)
 		}
 		c.Participants[r.node] = st
@@ -424,7 +442,7 @@ func (c *coordinator) commitAll(ctx context.Context, req *StatusRequest, nodes m
 	}
 	errChan := make(chan pair)
 	aCounter := int64(len(nodes))
-	g, ctx := errgroup.WithContext(ctx)
+	g, ctx := enterrors.NewErrorGroupWithContextWrapper(c.log, ctx)
 	g.SetLimit(_MaxNumberConns)
 	for node, hostname := range nodes {
 		node, hostname := node, hostname
@@ -470,20 +488,10 @@ func (c *coordinator) abortAll(ctx context.Context, req *AbortRequest, nodes map
 
 // groupByShard returns classes group by nodes
 func (c *coordinator) groupByShard(ctx context.Context, classes []string) (nodeMap, error) {
-	m := make(nodeMap, 32)
-	for _, cls := range classes {
-		nodes, err := c.selector.Shards(ctx, cls)
-		if err != nil {
-			return nil, fmt.Errorf("class %q: %w", cls, errNoShardFound)
-		}
-		for _, node := range nodes {
-			nd, ok := m[node]
-			if !ok {
-				nd = &backup.NodeDescriptor{Classes: make([]string, 0, 5)}
-			}
-			nd.Classes = append(nd.Classes, cls)
-			m[node] = nd
-		}
+	nodes := c.nodeResolver.AllNames()
+	m := make(nodeMap, len(nodes))
+	for _, node := range nodes {
+		m[node] = &backup.NodeDescriptor{Classes: slices.Clone(classes)}
 	}
 	return m, nil
 }

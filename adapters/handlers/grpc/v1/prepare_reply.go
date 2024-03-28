@@ -4,7 +4,7 @@
 //  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
 //   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
 //
-//  Copyright © 2016 - 2023 Weaviate B.V. All rights reserved.
+//  Copyright © 2016 - 2024 Weaviate B.V. All rights reserved.
 //
 //  CONTACT: hello@weaviate.io
 //
@@ -13,9 +13,14 @@ package v1
 
 import (
 	"fmt"
+	"math/big"
+	"strings"
 	"time"
 
+	"github.com/weaviate/weaviate/usecases/byteops"
+
 	"github.com/weaviate/weaviate/entities/schema"
+	generative "github.com/weaviate/weaviate/usecases/modulecomponents/additional/generate"
 	"github.com/weaviate/weaviate/usecases/modulecomponents/additional/models"
 
 	"github.com/go-openapi/strfmt"
@@ -27,24 +32,27 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
-func searchResultsToProto(res []interface{}, start time.Time, searchParams dto.GetParams, scheme schema.Schema) (*pb.SearchReply, error) {
+func searchResultsToProto(res []interface{}, start time.Time, searchParams dto.GetParams, scheme schema.Schema, usesPropertiesMessage bool) (*pb.SearchReply, error) {
 	tookSeconds := float64(time.Since(start)) / float64(time.Second)
 	out := &pb.SearchReply{
-		Took: float32(tookSeconds),
+		Took:                    float32(tookSeconds),
+		GenerativeGroupedResult: new(string), // pointer to empty string
 	}
 
 	if searchParams.GroupBy != nil {
 		out.GroupByResults = make([]*pb.GroupByResult, len(res))
 		for i, raw := range res {
-			group, generativeGroupResponse, err := extractGroup(raw, searchParams, scheme)
+			group, generativeGroupResponse, err := extractGroup(raw, searchParams, scheme, usesPropertiesMessage)
 			if err != nil {
 				return nil, err
 			}
-			out.GenerativeGroupedResult = &generativeGroupResponse
+			if generativeGroupResponse != "" {
+				out.GenerativeGroupedResult = &generativeGroupResponse
+			}
 			out.GroupByResults[i] = group
 		}
 	} else {
-		objects, generativeGroupResponse, err := extractObjectsToResults(res, searchParams, scheme, false)
+		objects, generativeGroupResponse, err := extractObjectsToResults(res, searchParams, scheme, false, usesPropertiesMessage)
 		if err != nil {
 			return nil, err
 		}
@@ -54,7 +62,7 @@ func searchResultsToProto(res []interface{}, start time.Time, searchParams dto.G
 	return out, nil
 }
 
-func extractObjectsToResults(res []interface{}, searchParams dto.GetParams, scheme schema.Schema, fromGroup bool) ([]*pb.SearchResult, string, error) {
+func extractObjectsToResults(res []interface{}, searchParams dto.GetParams, scheme schema.Schema, fromGroup, usesPropertiesMessage bool) ([]*pb.SearchResult, string, error) {
 	results := make([]*pb.SearchResult, len(res))
 	generativeGroupResultsReturn := ""
 	for i, raw := range res {
@@ -64,7 +72,14 @@ func extractObjectsToResults(res []interface{}, searchParams dto.GetParams, sche
 		}
 		firstObject := i == 0
 
-		props, err := extractPropertiesAnswer(scheme, asMap, searchParams.Properties, searchParams.ClassName, searchParams.AdditionalProperties)
+		var props *pb.PropertiesResult
+		var err error
+
+		if usesPropertiesMessage {
+			props, err = extractPropertiesAnswer(scheme, asMap, searchParams.Properties, searchParams.ClassName, searchParams.AdditionalProperties)
+		} else {
+			props, err = extractPropertiesAnswerDeprecated(scheme, asMap, searchParams.Properties, searchParams.ClassName, searchParams.AdditionalProperties)
+		}
 		if err != nil {
 			return nil, "", err
 		}
@@ -74,7 +89,7 @@ func extractObjectsToResults(res []interface{}, searchParams dto.GetParams, sche
 			return nil, "", err
 		}
 
-		if firstObject && generativeGroupResults != "" {
+		if generativeGroupResultsReturn == "" && generativeGroupResults != "" {
 			generativeGroupResultsReturn = generativeGroupResults
 		}
 
@@ -88,26 +103,40 @@ func extractObjectsToResults(res []interface{}, searchParams dto.GetParams, sche
 	return results, generativeGroupResultsReturn, nil
 }
 
-func extractAdditionalProps(asMap map[string]any, additionalPropsParams additional.Properties, firstObject, fromGroup bool) (*pb.MetadataResult, string, error) {
-	err := errors.New("could not extract additional prop")
-	_, generativeSearchEnabled := additionalPropsParams.ModuleParams["generate"]
+func idToByte(idRaw interface{}) ([]byte, string, error) {
+	idStrfmt, ok := idRaw.(strfmt.UUID)
+	if !ok {
+		return nil, "", errors.New("could not extract format id in additional prop")
+	}
+	idStrfmtStr := idStrfmt.String()
+	hexInteger, success := new(big.Int).SetString(strings.Replace(idStrfmtStr, "-", "", -1), 16)
+	if !success {
+		return nil, "", fmt.Errorf("failed to parse hex string to integer")
+	}
+	return hexInteger.Bytes(), idStrfmtStr, nil
+}
 
-	additionalProps := &pb.MetadataResult{}
-	if additionalPropsParams.ID && !generativeSearchEnabled && !fromGroup {
+func extractAdditionalProps(asMap map[string]any, additionalPropsParams additional.Properties, firstObject, fromGroup bool) (*pb.MetadataResult, string, error) {
+	generativeSearchRaw, generativeSearchEnabled := additionalPropsParams.ModuleParams["generate"]
+	_, rerankEnabled := additionalPropsParams.ModuleParams["rerank"]
+
+	metadata := &pb.MetadataResult{}
+	if additionalPropsParams.ID && !generativeSearchEnabled && !rerankEnabled && !fromGroup {
 		idRaw, ok := asMap["id"]
 		if !ok {
-			return nil, "", errors.Wrap(err, "get id")
+			return nil, "", errors.New("could not extract get id in additional prop")
 		}
 
-		idStrfmt, ok := idRaw.(strfmt.UUID)
-		if !ok {
-			return nil, "", errors.Wrap(err, "format id")
+		idToBytes, idAsString, err := idToByte(idRaw)
+		if err != nil {
+			return nil, "", errors.Wrap(err, "could not extract format id in additional prop")
 		}
-		additionalProps.Id = idStrfmt.String()
+		metadata.Id = idAsString
+		metadata.IdAsBytes = idToBytes
 	}
 	_, ok := asMap["_additional"]
 	if !ok {
-		return additionalProps, "", nil
+		return metadata, "", nil
 	}
 
 	var additionalPropertiesMap map[string]interface{}
@@ -121,47 +150,74 @@ func extractAdditionalProps(asMap map[string]any, additionalPropsParams addition
 		additionalPropertiesMap["distance"] = addPropertiesGroup.Distance
 	}
 	generativeGroupResults := ""
-	// id is part of the _additional map in case of generative search - don't aks me why
-	if generativeSearchEnabled || fromGroup {
+	// id is part of the _additional map in case of generative search, group, & rerank - don't aks me why
+	if additionalPropsParams.ID && (generativeSearchEnabled || fromGroup || rerankEnabled) {
 		idRaw, ok := additionalPropertiesMap["id"]
 		if !ok {
-			return nil, "", errors.Wrap(err, "get id generative")
+			return nil, "", errors.New("could not extract get id generative in additional prop")
 		}
 
-		idStrfmt, ok := idRaw.(strfmt.UUID)
-		if !ok {
-			return nil, "", errors.Wrap(err, "format id generative")
+		idToBytes, idAsString, err := idToByte(idRaw)
+		if err != nil {
+			return nil, "", errors.Wrap(err, "could not extract format id in additional prop")
 		}
-		additionalProps.Id = idStrfmt.String()
+		metadata.Id = idAsString
+		metadata.IdAsBytes = idToBytes
 	}
 
 	if generativeSearchEnabled {
+		var generateFmt *models.GenerateResult
+
 		generate, ok := additionalPropertiesMap["generate"]
-		if !ok && firstObject {
-			return nil, "", errors.Wrap(err,
-				"No results for generative search despite a search request. Is a the generative module enabled?",
-			)
-		}
-
-		if ok { // does not always have content, for example with grouped results only the first object has an entry
-			generateFmt, ok := generate.(*models.GenerateResult)
+		if !ok {
+			generateFmt = &models.GenerateResult{}
+		} else {
+			generateFmt, ok = generate.(*models.GenerateResult)
 			if !ok {
-				return nil, "", errors.Wrap(err, "cast generative result")
-			}
-			if generateFmt.Error != nil {
-				return nil, "", generateFmt.Error
-			}
-
-			if generateFmt.SingleResult != nil && *generateFmt.SingleResult != "" {
-				additionalProps.Generative = *generateFmt.SingleResult
-				additionalProps.GenerativePresent = true
-			}
-
-			// grouped results are only added to the first object for GQL reasons
-			if firstObject && generateFmt.GroupedResult != nil && *generateFmt.GroupedResult != "" {
-				generativeGroupResults = *generateFmt.GroupedResult
+				return nil, "", errors.New("could not cast generative result additional prop")
 			}
 		}
+
+		if generateFmt.Error != nil {
+			return nil, "", generateFmt.Error
+		}
+
+		generativeSearch, ok := generativeSearchRaw.(*generative.Params)
+		if !ok {
+			return nil, "", errors.New("could not cast generative search params")
+		}
+		if generativeSearch.Prompt != nil && generateFmt.SingleResult == nil {
+			return nil, "", errors.New("No results for generative search despite a search request. Is a generative module enabled?")
+		}
+
+		if generateFmt.Error != nil {
+			return nil, "", generateFmt.Error
+		}
+
+		if generateFmt.SingleResult != nil && *generateFmt.SingleResult != "" {
+			metadata.Generative = *generateFmt.SingleResult
+			metadata.GenerativePresent = true
+		}
+
+		// grouped results are only added to the first object for GQL reasons
+		// however, reranking can result in a different order, so we need to check every object
+		// recording the result if it's present assuming that it is at least somewhere and will be caught
+		if generateFmt.GroupedResult != nil && *generateFmt.GroupedResult != "" {
+			generativeGroupResults = *generateFmt.GroupedResult
+		}
+	}
+
+	if rerankEnabled {
+		rerank, ok := additionalPropertiesMap["rerank"]
+		if !ok {
+			return nil, "", errors.New("No results for rerank despite a search request. Is a the rerank module enabled?")
+		}
+		rerankFmt, ok := rerank.([]*models.RankResult)
+		if !ok {
+			return nil, "", errors.New("could not cast rerank result additional prop")
+		}
+		metadata.RerankScore = *rerankFmt[0].Score
+		metadata.RerankScorePresent = true
 	}
 
 	// additional properties are only present for certain searches/configs => don't return an error if not available
@@ -170,79 +226,97 @@ func extractAdditionalProps(asMap map[string]any, additionalPropsParams addition
 		if ok {
 			vectorfmt, ok2 := vector.([]float32)
 			if ok2 {
-				additionalProps.Vector = vectorfmt
+				metadata.Vector = vectorfmt // deprecated, remove in a bit
+				metadata.VectorBytes = byteops.Float32ToByteVector(vectorfmt)
 			}
 		}
 	}
 
+	if len(additionalPropsParams.Vectors) > 0 {
+		vectors, ok := additionalPropertiesMap["vectors"]
+		if ok {
+			vectorfmt, ok2 := vectors.(map[string][]float32)
+			if ok2 {
+				metadata.Vectors = make([]*pb.Vectors, 0, len(vectorfmt))
+				for name, vector := range vectorfmt {
+					metadata.Vectors = append(metadata.Vectors, &pb.Vectors{
+						VectorBytes: byteops.Float32ToByteVector(vector),
+						Name:        name,
+					})
+				}
+			}
+
+		}
+	}
+
 	if additionalPropsParams.Certainty {
-		additionalProps.CertaintyPresent = false
+		metadata.CertaintyPresent = false
 		certainty, ok := additionalPropertiesMap["certainty"]
 		if ok {
 			certaintyfmt, ok2 := certainty.(float64)
 			if ok2 {
-				additionalProps.Certainty = float32(certaintyfmt)
-				additionalProps.CertaintyPresent = true
+				metadata.Certainty = float32(certaintyfmt)
+				metadata.CertaintyPresent = true
 			}
 		}
 	}
 
 	if additionalPropsParams.Distance {
-		additionalProps.DistancePresent = false
+		metadata.DistancePresent = false
 		distance, ok := additionalPropertiesMap["distance"]
 		if ok {
 			distancefmt, ok2 := distance.(float32)
 			if ok2 {
-				additionalProps.Distance = distancefmt
-				additionalProps.DistancePresent = true
+				metadata.Distance = distancefmt
+				metadata.DistancePresent = true
 			}
 		}
 	}
 
 	if additionalPropsParams.CreationTimeUnix {
-		additionalProps.CreationTimeUnixPresent = false
+		metadata.CreationTimeUnixPresent = false
 		creationtime, ok := additionalPropertiesMap["creationTimeUnix"]
 		if ok {
 			creationtimefmt, ok2 := creationtime.(int64)
 			if ok2 {
-				additionalProps.CreationTimeUnix = creationtimefmt
-				additionalProps.CreationTimeUnixPresent = true
+				metadata.CreationTimeUnix = creationtimefmt
+				metadata.CreationTimeUnixPresent = true
 			}
 		}
 	}
 
 	if additionalPropsParams.LastUpdateTimeUnix {
-		additionalProps.LastUpdateTimeUnixPresent = false
+		metadata.LastUpdateTimeUnixPresent = false
 		lastUpdateTime, ok := additionalPropertiesMap["lastUpdateTimeUnix"]
 		if ok {
 			lastUpdateTimefmt, ok2 := lastUpdateTime.(int64)
 			if ok2 {
-				additionalProps.LastUpdateTimeUnix = lastUpdateTimefmt
-				additionalProps.LastUpdateTimeUnixPresent = true
+				metadata.LastUpdateTimeUnix = lastUpdateTimefmt
+				metadata.LastUpdateTimeUnixPresent = true
 			}
 		}
 	}
 
 	if additionalPropsParams.ExplainScore {
-		additionalProps.ExplainScorePresent = false
+		metadata.ExplainScorePresent = false
 		explainScore, ok := additionalPropertiesMap["explainScore"]
 		if ok {
 			explainScorefmt, ok2 := explainScore.(string)
 			if ok2 {
-				additionalProps.ExplainScore = explainScorefmt
-				additionalProps.ExplainScorePresent = true
+				metadata.ExplainScore = explainScorefmt
+				metadata.ExplainScorePresent = true
 			}
 		}
 	}
 
 	if additionalPropsParams.Score {
-		additionalProps.ScorePresent = false
+		metadata.ScorePresent = false
 		score, ok := additionalPropertiesMap["score"]
 		if ok {
 			scorefmt, ok2 := score.(float32)
 			if ok2 {
-				additionalProps.Score = scorefmt
-				additionalProps.ScorePresent = true
+				metadata.Score = scorefmt
+				metadata.ScorePresent = true
 			}
 		}
 	}
@@ -252,15 +326,18 @@ func extractAdditionalProps(asMap map[string]any, additionalPropsParams addition
 		if ok {
 			isConsistentfmt, ok2 := isConsistent.(bool)
 			if ok2 {
-				additionalProps.IsConsistent = &isConsistentfmt
+				metadata.IsConsistent = &isConsistentfmt
+				metadata.IsConsistentPresent = true
 			}
 		}
 	}
 
-	return additionalProps, generativeGroupResults, nil
+	return metadata, generativeGroupResults, nil
 }
 
-func extractGroup(raw any, searchParams dto.GetParams, scheme schema.Schema) (*pb.GroupByResult, string, error) {
+func extractGroup(raw any, searchParams dto.GetParams, scheme schema.Schema, usesMarshalling bool) (*pb.GroupByResult, string, error) {
+	generativeSearchRaw, generativeSearchEnabled := searchParams.AdditionalProperties.ModuleParams["generate"]
+	_, rerankEnabled := searchParams.AdditionalProperties.ModuleParams["rerank"]
 	asMap, ok := raw.(map[string]interface{})
 	if !ok {
 		return nil, "", fmt.Errorf("cannot parse result %v", raw)
@@ -282,6 +359,65 @@ func extractGroup(raw any, searchParams dto.GetParams, scheme schema.Schema) (*p
 		return nil, "", fmt.Errorf("cannot parse _additional %v", groupRaw)
 	}
 
+	ret := &pb.GroupByResult{
+		Name:            group.GroupedBy.Value,
+		MaxDistance:     group.MaxDistance,
+		MinDistance:     group.MinDistance,
+		NumberOfObjects: int64(group.Count),
+	}
+
+	groupedGenerativeResults := ""
+	if generativeSearchEnabled {
+		var generateFmt *models.GenerateResult
+
+		generate, ok := addAsMap["generate"]
+		if !ok {
+			generateFmt = &models.GenerateResult{}
+		} else {
+			generateFmt, ok = generate.(*models.GenerateResult)
+			if !ok {
+				return nil, "", errors.New("could not cast generative result additional prop")
+			}
+		}
+
+		generativeSearch, ok := generativeSearchRaw.(*generative.Params)
+		if !ok {
+			return nil, "", errors.New("could not cast generative search params")
+		}
+		if generativeSearch.Prompt != nil && generateFmt.SingleResult == nil {
+			return nil, "", errors.New("No results for generative search despite a search request. Is a generative module enabled?")
+		}
+
+		if generateFmt.Error != nil {
+			return nil, "", generateFmt.Error
+		}
+
+		if generateFmt.SingleResult != nil && *generateFmt.SingleResult != "" {
+			ret.Generative = &pb.GenerativeReply{Result: *generateFmt.SingleResult}
+		}
+
+		// grouped results are only added to the first object for GQL reasons
+		// however, reranking can result in a different order, so we need to check every object
+		// recording the result if it's present assuming that it is at least somewhere and will be caught
+		if generateFmt.GroupedResult != nil && *generateFmt.GroupedResult != "" {
+			groupedGenerativeResults = *generateFmt.GroupedResult
+		}
+	}
+
+	if rerankEnabled {
+		rerankRaw, ok := addAsMap["rerank"]
+		if !ok {
+			return nil, "", fmt.Errorf("rerank is not present %v", addAsMap)
+		}
+		rerank, ok := rerankRaw.([]*models.RankResult)
+		if !ok {
+			return nil, "", fmt.Errorf("cannot parse rerank %v", rerankRaw)
+		}
+		ret.Rerank = &pb.RerankReply{
+			Score: *rerank[0].Score,
+		}
+	}
+
 	// group results does not support more additional properties
 	searchParams.AdditionalProperties = additional.Properties{
 		ID:       searchParams.AdditionalProperties.ID,
@@ -298,17 +434,17 @@ func extractGroup(raw any, searchParams dto.GetParams, scheme schema.Schema) (*p
 		returnObjectsUntyped[i] = group.Hits[i]
 	}
 
-	objects, groupedGenerativeResults, err := extractObjectsToResults(returnObjectsUntyped, searchParams, scheme, true)
+	objects, _, err := extractObjectsToResults(returnObjectsUntyped, searchParams, scheme, true, usesMarshalling)
 	if err != nil {
 		return nil, "", errors.Wrap(err, "extracting hits from group")
 	}
 
-	ret := &pb.GroupByResult{Name: group.GroupedBy.Value, MaxDistance: group.MaxDistance, MinDistance: group.MinDistance, NumberOfObjects: int64(group.Count), Objects: objects}
+	ret.Objects = objects
 
 	return ret, groupedGenerativeResults, nil
 }
 
-func extractPropertiesAnswer(scheme schema.Schema, results map[string]interface{}, properties search.SelectProperties, className string, additionalPropsParams additional.Properties) (*pb.PropertiesResult, error) {
+func extractPropertiesAnswerDeprecated(scheme schema.Schema, results map[string]interface{}, properties search.SelectProperties, className string, additionalPropsParams additional.Properties) (*pb.PropertiesResult, error) {
 	nonRefProps := make(map[string]interface{}, 0)
 	refProps := make([]*pb.RefPropertiesResult, 0)
 	objProps := make([]*pb.ObjectProperties, 0)
@@ -372,7 +508,7 @@ func extractPropertiesAnswer(scheme schema.Schema, results map[string]interface{
 			if !ok {
 				continue
 			}
-			extractedRefProp, err := extractPropertiesAnswer(scheme, refLocal.Fields, prop.Refs[0].RefProperties, refLocal.Class, additionalPropsParams)
+			extractedRefProp, err := extractPropertiesAnswerDeprecated(scheme, refLocal.Fields, prop.Refs[0].RefProperties, refLocal.Class, additionalPropsParams)
 			if err != nil {
 				continue
 			}
@@ -416,7 +552,82 @@ func extractPropertiesAnswer(scheme schema.Schema, results map[string]interface{
 	}
 
 	props.TargetCollection = className
+	return &props, nil
+}
 
+func extractPropertiesAnswer(scheme schema.Schema, results map[string]interface{}, properties search.SelectProperties, className string, additionalPropsParams additional.Properties) (*pb.PropertiesResult, error) {
+	nonRefProps := &pb.Properties{
+		Fields: make(map[string]*pb.Value, 0),
+	}
+	refProps := make([]*pb.RefPropertiesResult, 0)
+	class := scheme.GetClass(schema.ClassName(className))
+	for _, prop := range properties {
+		propRaw, ok := results[prop.Name]
+
+		if !ok {
+			if prop.IsPrimitive || prop.IsObject {
+				nonRefProps.Fields[prop.Name] = NewNilValue()
+			}
+			continue
+		}
+		if prop.IsPrimitive {
+			dataType, err := schema.GetPropertyDataType(class, prop.Name)
+			if err != nil {
+				return nil, errors.Wrap(err, "getting primitive property datatype")
+			}
+			value, err := NewPrimitiveValue(propRaw, *dataType)
+			if err != nil {
+				return nil, errors.Wrapf(err, "creating primitive value for %v", prop.Name)
+			}
+			nonRefProps.Fields[prop.Name] = value
+			continue
+		}
+		if prop.IsObject {
+			nested, err := scheme.GetProperty(schema.ClassName(className), schema.PropertyName(prop.Name))
+			if err != nil {
+				return nil, errors.Wrap(err, "getting nested property")
+			}
+			value, err := NewNestedValue(propRaw, schema.DataType(nested.DataType[0]), &Property{Property: nested}, prop)
+			if err != nil {
+				return nil, errors.Wrap(err, "creating object value")
+			}
+			nonRefProps.Fields[prop.Name] = value
+			continue
+		}
+		refs, ok := propRaw.([]interface{})
+		if !ok {
+			continue
+		}
+		extractedRefProps := make([]*pb.PropertiesResult, 0, len(refs))
+		for _, ref := range refs {
+			refLocal, ok := ref.(search.LocalRef)
+			if !ok {
+				continue
+			}
+			extractedRefProp, err := extractPropertiesAnswer(scheme, refLocal.Fields, prop.Refs[0].RefProperties, refLocal.Class, additionalPropsParams)
+			if err != nil {
+				continue
+			}
+			additionalProps, _, err := extractAdditionalProps(refLocal.Fields, prop.Refs[0].AdditionalProperties, false, false)
+			if err != nil {
+				return nil, err
+			}
+			extractedRefProp.Metadata = additionalProps
+			extractedRefProps = append(extractedRefProps, extractedRefProp)
+		}
+
+		refProp := pb.RefPropertiesResult{PropName: prop.Name, Properties: extractedRefProps}
+		refProps = append(refProps, &refProp)
+	}
+	props := pb.PropertiesResult{}
+	if len(nonRefProps.Fields) != 0 {
+		props.NonRefProps = nonRefProps
+	}
+	if len(refProps) != 0 {
+		props.RefProps = refProps
+	}
+	props.RefPropsRequested = properties.HasRefs()
+	props.TargetCollection = className
 	return &props, nil
 }
 
@@ -551,6 +762,10 @@ func extractArrayTypes(scheme schema.Schema, rawProps map[string]interface{}, pr
 		case schema.DataTypeIntArray:
 			propIntAsFloat, ok := prop.([]float64)
 			if !ok {
+				emptyArr, ok := prop.([]interface{})
+				if ok && len(emptyArr) == 0 {
+					continue
+				}
 				return fmt.Errorf("property %v with datatype %v needs to be []float64, got %T", propName, dataType, prop)
 			}
 			propInt := make([]int64, len(propIntAsFloat))
@@ -563,18 +778,30 @@ func extractArrayTypes(scheme schema.Schema, rawProps map[string]interface{}, pr
 			props.IntArrayProperties = append(props.IntArrayProperties, &pb.IntArrayProperties{PropName: propName, Values: propInt})
 			delete(rawProps, propName)
 		case schema.DataTypeNumberArray:
-			propIntAsFloat, ok := prop.([]float64)
+			propFloat, ok := prop.([]float64)
 			if !ok {
+				emptyArr, ok := prop.([]interface{})
+				if ok && len(emptyArr) == 0 {
+					continue
+				}
 				return fmt.Errorf("property %v with datatype %v needs to be []float64, got %T", propName, dataType, prop)
 			}
+
 			if props.NumberArrayProperties == nil {
 				props.NumberArrayProperties = make([]*pb.NumberArrayProperties, 0)
 			}
-			props.NumberArrayProperties = append(props.NumberArrayProperties, &pb.NumberArrayProperties{PropName: propName, Values: propIntAsFloat})
+			props.NumberArrayProperties = append(
+				props.NumberArrayProperties,
+				&pb.NumberArrayProperties{PropName: propName, ValuesBytes: byteops.Float64ToByteVector(propFloat), Values: propFloat},
+			)
 			delete(rawProps, propName)
 		case schema.DataTypeStringArray, schema.DataTypeTextArray, schema.DataTypeDateArray, schema.DataTypeUUIDArray:
 			propString, ok := prop.([]string)
 			if !ok {
+				emptyArr, ok := prop.([]interface{})
+				if ok && len(emptyArr) == 0 {
+					continue
+				}
 				return fmt.Errorf("property %v with datatype %v needs to be []string, got %T", propName, dataType, prop)
 			}
 			if props.TextArrayProperties == nil {
@@ -585,6 +812,10 @@ func extractArrayTypes(scheme schema.Schema, rawProps map[string]interface{}, pr
 		case schema.DataTypeBooleanArray:
 			propBool, ok := prop.([]bool)
 			if !ok {
+				emptyArr, ok := prop.([]interface{})
+				if ok && len(emptyArr) == 0 {
+					continue
+				}
 				return fmt.Errorf("property %v with datatype %v needs to be []bool, got %T", propName, dataType, prop)
 			}
 			if props.BooleanArrayProperties == nil {
@@ -597,7 +828,6 @@ func extractArrayTypes(scheme schema.Schema, rawProps map[string]interface{}, pr
 			if isArray {
 				return fmt.Errorf("property %v with array type not handled %v", propName, dataType)
 			}
-			continue
 		}
 	}
 	return nil

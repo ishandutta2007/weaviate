@@ -4,7 +4,7 @@
 //  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
 //   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
 //
-//  Copyright © 2016 - 2023 Weaviate B.V. All rights reserved.
+//  Copyright © 2016 - 2024 Weaviate B.V. All rights reserved.
 //
 //  CONTACT: hello@weaviate.io
 //
@@ -15,6 +15,11 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/sirupsen/logrus"
+	enterrors "github.com/weaviate/weaviate/entities/errors"
+
+	"github.com/weaviate/weaviate/usecases/config"
 
 	"github.com/weaviate/weaviate/usecases/objects"
 
@@ -34,11 +39,13 @@ type Service struct {
 	allowAnonymousAccess bool
 	schemaManager        *schemaManager.Manager
 	batchManager         *objects.BatchManager
+	config               *config.Config
+	logger               logrus.FieldLogger
 }
 
 func NewService(traverser *traverser.Traverser, authComposer composer.TokenFunc,
 	allowAnonymousAccess bool, schemaManager *schemaManager.Manager,
-	batchManager *objects.BatchManager,
+	batchManager *objects.BatchManager, config *config.Config, logger logrus.FieldLogger,
 ) *Service {
 	return &Service{
 		traverser:            traverser,
@@ -46,7 +53,42 @@ func NewService(traverser *traverser.Traverser, authComposer composer.TokenFunc,
 		allowAnonymousAccess: allowAnonymousAccess,
 		schemaManager:        schemaManager,
 		batchManager:         batchManager,
+		config:               config,
+		logger:               logger,
 	}
+}
+
+func (s *Service) BatchDelete(ctx context.Context, req *pb.BatchDeleteRequest) (*pb.BatchDeleteReply, error) {
+	before := time.Now()
+	principal, err := s.principalFromContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("extract auth: %w", err)
+	}
+	replicationProperties := extractReplicationProperties(req.ConsistencyLevel)
+	scheme := s.schemaManager.GetSchemaSkipAuth()
+
+	params, err := batchDeleteParamsFromProto(req, scheme)
+	if err != nil {
+		return nil, fmt.Errorf("batch delete params: %w", err)
+	}
+
+	tenant := ""
+	if req.Tenant != nil {
+		tenant = *req.Tenant
+	}
+
+	response, err := s.batchManager.DeleteObjectsFromGRPC(ctx, principal, params, replicationProperties, tenant)
+	if err != nil {
+		return nil, fmt.Errorf("batch delete: %w", err)
+	}
+
+	result, err := batchDeleteReplyFromObjects(response, req.Verbose)
+	if err != nil {
+		return nil, fmt.Errorf("batch delete reply: %w", err)
+	}
+	result.Took = float32(time.Since(before).Seconds())
+
+	return result, nil
 }
 
 func (s *Service) BatchObjects(ctx context.Context, req *pb.BatchObjectsRequest) (*pb.BatchObjectsReply, error) {
@@ -101,7 +143,7 @@ func (s *Service) Search(ctx context.Context, req *pb.SearchRequest) (*pb.Search
 	}
 
 	c := make(chan reply, 1)
-	go func() {
+	f := func() {
 		defer func() {
 			if err := recover(); err != nil {
 				c <- reply{
@@ -111,7 +153,7 @@ func (s *Service) Search(ctx context.Context, req *pb.SearchRequest) (*pb.Search
 			}
 		}()
 
-		searchParams, err := searchParamsFromProto(req, scheme)
+		searchParams, err := searchParamsFromProto(req, scheme, s.config)
 		if err != nil {
 			c <- reply{
 				Result: nil,
@@ -134,12 +176,13 @@ func (s *Service) Search(ctx context.Context, req *pb.SearchRequest) (*pb.Search
 			}
 		}
 
-		proto, err := searchResultsToProto(res, before, searchParams, scheme)
+		proto, err := searchResultsToProto(res, before, searchParams, scheme, req.Uses_123Api)
 		c <- reply{
 			Result: proto,
 			Error:  err,
 		}
-	}()
+	}
+	enterrors.GoWrapper(f, s.logger)
 	res := <-c
 	return res.Result, res.Error
 }

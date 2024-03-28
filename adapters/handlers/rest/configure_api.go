@@ -4,7 +4,7 @@
 //  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
 //   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
 //
-//  Copyright © 2016 - 2023 Weaviate B.V. All rights reserved.
+//  Copyright © 2016 - 2024 Weaviate B.V. All rights reserved.
 //
 //  CONTACT: hello@weaviate.io
 //
@@ -19,14 +19,19 @@ import (
 	"net/http"
 	"os"
 	goruntime "runtime"
+	"runtime/debug"
 	"strings"
 	"time"
 
+	enterrors "github.com/weaviate/weaviate/entities/errors"
+
 	_ "net/http/pprof"
 
+	"github.com/KimMachineGun/automemlimit/memlimit"
 	openapierrors "github.com/go-openapi/errors"
 	"github.com/go-openapi/runtime"
 	"github.com/go-openapi/swag"
+	"github.com/pbnjay/memory"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
@@ -42,17 +47,21 @@ import (
 	txstore "github.com/weaviate/weaviate/adapters/repos/transactions"
 	"github.com/weaviate/weaviate/entities/moduletools"
 	"github.com/weaviate/weaviate/entities/replication"
-	enthnsw "github.com/weaviate/weaviate/entities/vectorindex/hnsw"
+	vectorIndex "github.com/weaviate/weaviate/entities/vectorindex"
 	modstgazure "github.com/weaviate/weaviate/modules/backup-azure"
 	modstgfs "github.com/weaviate/weaviate/modules/backup-filesystem"
 	modstggcs "github.com/weaviate/weaviate/modules/backup-gcs"
 	modstgs3 "github.com/weaviate/weaviate/modules/backup-s3"
+	modgenerativeanyscale "github.com/weaviate/weaviate/modules/generative-anyscale"
+	modgenerativeaws "github.com/weaviate/weaviate/modules/generative-aws"
 	modgenerativecohere "github.com/weaviate/weaviate/modules/generative-cohere"
+	modgenerativemistral "github.com/weaviate/weaviate/modules/generative-mistral"
 	modgenerativeopenai "github.com/weaviate/weaviate/modules/generative-openai"
 	modgenerativepalm "github.com/weaviate/weaviate/modules/generative-palm"
 	modimage "github.com/weaviate/weaviate/modules/img2vec-neural"
 	modbind "github.com/weaviate/weaviate/modules/multi2vec-bind"
 	modclip "github.com/weaviate/weaviate/modules/multi2vec-clip"
+	modmulti2vecpalm "github.com/weaviate/weaviate/modules/multi2vec-palm"
 	modner "github.com/weaviate/weaviate/modules/ner-transformers"
 	modqnaopenai "github.com/weaviate/weaviate/modules/qna-openai"
 	modqna "github.com/weaviate/weaviate/modules/qna-transformers"
@@ -61,13 +70,16 @@ import (
 	modrerankertransformers "github.com/weaviate/weaviate/modules/reranker-transformers"
 	modsum "github.com/weaviate/weaviate/modules/sum-transformers"
 	modspellcheck "github.com/weaviate/weaviate/modules/text-spellcheck"
+	modtext2vecaws "github.com/weaviate/weaviate/modules/text2vec-aws"
 	modcohere "github.com/weaviate/weaviate/modules/text2vec-cohere"
 	modcontextionary "github.com/weaviate/weaviate/modules/text2vec-contextionary"
 	modgpt4all "github.com/weaviate/weaviate/modules/text2vec-gpt4all"
 	modhuggingface "github.com/weaviate/weaviate/modules/text2vec-huggingface"
+	modjinaai "github.com/weaviate/weaviate/modules/text2vec-jinaai"
 	modopenai "github.com/weaviate/weaviate/modules/text2vec-openai"
 	modtext2vecpalm "github.com/weaviate/weaviate/modules/text2vec-palm"
 	modtransformers "github.com/weaviate/weaviate/modules/text2vec-transformers"
+	modvoyageai "github.com/weaviate/weaviate/modules/text2vec-voyageai"
 	"github.com/weaviate/weaviate/usecases/auth/authentication/composer"
 	"github.com/weaviate/weaviate/usecases/backup"
 	"github.com/weaviate/weaviate/usecases/classification"
@@ -81,6 +93,7 @@ import (
 	schemaUC "github.com/weaviate/weaviate/usecases/schema"
 	"github.com/weaviate/weaviate/usecases/schema/migrate"
 	"github.com/weaviate/weaviate/usecases/sharding"
+	"github.com/weaviate/weaviate/usecases/telemetry"
 	"github.com/weaviate/weaviate/usecases/traverser"
 )
 
@@ -104,18 +117,30 @@ type vectorRepo interface {
 	Shutdown(ctx context.Context) error
 }
 
+func getCores() (int, error) {
+	cpuset, err := os.ReadFile("/sys/fs/cgroup/cpuset/cpuset.cpus")
+	if err != nil {
+		return 0, errors.Wrap(err, "read cpuset")
+	}
+
+	cores := strings.Split(strings.TrimSpace(string(cpuset)), ",")
+	return len(cores), nil
+}
+
 func MakeAppState(ctx context.Context, options *swag.CommandLineOptionsGroup) *state.State {
 	appState := startupRoutine(ctx, options)
-	setupGoProfiling(appState.ServerConfig.Config)
+	setupGoProfiling(appState.ServerConfig.Config, appState.Logger)
 
 	if appState.ServerConfig.Config.Monitoring.Enabled {
 		// only monitoring tool supported at the moment is prometheus
-		go func() {
+		enterrors.GoWrapper(func() {
 			mux := http.NewServeMux()
 			mux.Handle("/metrics", promhttp.Handler())
 			http.ListenAndServe(fmt.Sprintf(":%d", appState.ServerConfig.Config.Monitoring.Port), mux)
-		}()
+		}, appState.Logger)
 	}
+
+	limitResources(appState)
 
 	err := registerModules(appState)
 	if err != nil {
@@ -150,7 +175,7 @@ func MakeAppState(ctx context.Context, options *swag.CommandLineOptionsGroup) *s
 	repo, err := db.New(appState.Logger, db.Config{
 		ServerVersion:             config.ServerVersion,
 		GitHash:                   config.GitHash,
-		MemtablesFlushIdleAfter:   appState.ServerConfig.Config.Persistence.FlushIdleMemtablesAfter,
+		MemtablesFlushDirtyAfter:  appState.ServerConfig.Config.Persistence.MemtablesFlushDirtyAfter,
 		MemtablesInitialSizeMB:    10,
 		MemtablesMaxSizeMB:        appState.ServerConfig.Config.Persistence.MemtablesMaxSizeMB,
 		MemtablesMinActiveSeconds: appState.ServerConfig.Config.Persistence.MemtablesMinActiveDurationSeconds,
@@ -163,6 +188,7 @@ func MakeAppState(ctx context.Context, options *swag.CommandLineOptionsGroup) *s
 		TrackVectorDimensions:     appState.ServerConfig.Config.TrackVectorDimensions,
 		ResourceUsage:             appState.ServerConfig.Config.ResourceUsage,
 		AvoidMMap:                 appState.ServerConfig.Config.AvoidMmap,
+		DisableLazyLoadShards:     appState.ServerConfig.Config.DisableLazyLoadShards,
 		// Pass dummy replication config with minimum factor 1. Otherwise the
 		// setting is not backward-compatible. The user may have created a class
 		// with factor=1 before the change was introduced. Now their setup would no
@@ -224,7 +250,7 @@ func MakeAppState(ctx context.Context, options *swag.CommandLineOptionsGroup) *s
 
 	schemaManager, err := schemaUC.NewManager(migrator, schemaRepo,
 		appState.Logger, appState.Authorizer, appState.ServerConfig.Config,
-		enthnsw.ParseAndValidateConfig, appState.Modules, inverted.ValidateConfig,
+		vectorIndex.ParseAndValidateConfig, appState.Modules, inverted.ValidateConfig,
 		appState.Modules, appState.Cluster, schemaTxClient,
 		schemaTxPersistence, scaler,
 	)
@@ -245,7 +271,7 @@ func MakeAppState(ctx context.Context, options *swag.CommandLineOptionsGroup) *s
 		schemaManager, repo, appState.Modules)
 	appState.BackupManager = backupManager
 
-	go clusterapi.Serve(appState)
+	enterrors.GoWrapper(func() { clusterapi.Serve(appState) }, appState.Logger)
 
 	vectorRepo.SetSchemaGetter(schemaManager)
 	explorer.SetSchemaGetter(schemaManager)
@@ -306,12 +332,12 @@ func MakeAppState(ctx context.Context, options *swag.CommandLineOptionsGroup) *s
 	if len(reindexTaskNames) > 0 {
 		// start reindexing inverted indexes (if requested by user) in the background
 		// allowing db to complete api configuration and start handling requests
-		go func() {
+		enterrors.GoWrapper(func() {
 			appState.Logger.
 				WithField("action", "startup").
 				Info("Reindexing inverted indexes")
 			reindexFinished <- migrator.InvertedReindex(reindexCtx, reindexTaskNames...)
-		}()
+		}, appState.Logger)
 	}
 
 	configureServer = makeConfigureServer(appState)
@@ -399,7 +425,30 @@ func configureAPI(api *operations.WeaviateAPI) http.Handler {
 	setupMiddlewares := makeSetupMiddlewares(appState)
 	setupGlobalMiddleware := makeSetupGlobalMiddleware(appState)
 
+	telemeter := telemetry.New(appState.DB, appState.Modules, appState.Logger)
+	if telemetryEnabled(appState) {
+		enterrors.GoWrapper(func() {
+			if err := telemeter.Start(context.Background()); err != nil {
+				appState.Logger.
+					WithField("action", "startup").
+					Errorf("telemetry failed to start: %s", err.Error())
+			}
+		}, appState.Logger)
+	}
+
 	api.ServerShutdown = func() {
+		if telemetryEnabled(appState) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			// must be shutdown before the db, to ensure the
+			// termination payload contains the correct
+			// object count
+			if err := telemeter.Stop(ctx); err != nil {
+				appState.Logger.WithField("action", "stop_telemetry").
+					Errorf("failed to stop telemetry: %s", err.Error())
+			}
+		}
+
 		// stop reindexing on server shutdown
 		appState.ReindexCtxCancel()
 
@@ -439,6 +488,12 @@ func startupRoutine(ctx context.Context, options *swag.CommandLineOptionsGroup) 
 	err := serverConfig.LoadConfig(options, logger)
 	if err != nil {
 		logger.WithField("action", "startup").WithError(err).Error("could not load config")
+		logger.Exit(1)
+	}
+	dataPath := serverConfig.Config.Persistence.DataPath
+	if err := os.MkdirAll(dataPath, 0o777); err != nil {
+		logger.WithField("action", "startup").
+			WithField("path", dataPath).Error("cannot create data directory")
 		logger.Exit(1)
 	}
 
@@ -481,7 +536,7 @@ func startupRoutine(ctx context.Context, options *swag.CommandLineOptionsGroup) 
 	logger.WithField("action", "startup").WithField("startup_time_left", timeTillDeadline(ctx)).
 		Debug("initialized schema")
 
-	clusterState, err := cluster.Init(serverConfig.Config.Cluster, serverConfig.Config.Persistence.DataPath, logger)
+	clusterState, err := cluster.Init(serverConfig.Config.Cluster, dataPath, logger)
 	if err != nil {
 		logger.WithField("action", "startup").WithError(err).
 			Error("could not init cluster state")
@@ -509,6 +564,16 @@ func logger() *logrus.Logger {
 		logger.SetFormatter(&logrus.JSONFormatter{})
 	}
 	switch os.Getenv("LOG_LEVEL") {
+	case "panic":
+		logger.SetLevel(logrus.PanicLevel)
+	case "fatal":
+		logger.SetLevel(logrus.FatalLevel)
+	case "error":
+		logger.SetLevel(logrus.ErrorLevel)
+	case "warn":
+		logger.SetLevel(logrus.WarnLevel)
+	case "warning":
+		logger.SetLevel(logrus.WarnLevel)
 	case "debug":
 		logger.SetLevel(logrus.DebugLevel)
 	case "trace":
@@ -634,6 +699,14 @@ func registerModules(appState *state.State) error {
 			Debug("enabled module")
 	}
 
+	if _, ok := enabledModules[modmulti2vecpalm.Name]; ok {
+		appState.Modules.Register(modmulti2vecpalm.New())
+		appState.Logger.
+			WithField("action", "startup").
+			WithField("module", modmulti2vecpalm.Name).
+			Debug("enabled module")
+	}
+
 	if _, ok := enabledModules["text2vec-openai"]; ok {
 		appState.Modules.Register(modopenai.New())
 		appState.Logger.
@@ -658,11 +731,27 @@ func registerModules(appState *state.State) error {
 			Debug("enabled module")
 	}
 
+	if _, ok := enabledModules[modgenerativemistral.Name]; ok {
+		appState.Modules.Register(modgenerativemistral.New())
+		appState.Logger.
+			WithField("action", "startup").
+			WithField("module", modgenerativemistral.Name).
+			Debug("enabled module")
+	}
+
 	if _, ok := enabledModules[modgenerativeopenai.Name]; ok {
 		appState.Modules.Register(modgenerativeopenai.New())
 		appState.Logger.
 			WithField("action", "startup").
 			WithField("module", modgenerativeopenai.Name).
+			Debug("enabled module")
+	}
+
+	if _, ok := enabledModules[modgenerativeaws.Name]; ok {
+		appState.Modules.Register(modgenerativeaws.New())
+		appState.Logger.
+			WithField("action", "startup").
+			WithField("module", modgenerativeaws.Name).
 			Debug("enabled module")
 	}
 
@@ -682,11 +771,27 @@ func registerModules(appState *state.State) error {
 			Debug("enabled module")
 	}
 
+	if _, ok := enabledModules[modgenerativeanyscale.Name]; ok {
+		appState.Modules.Register(modgenerativeanyscale.New())
+		appState.Logger.
+			WithField("action", "startup").
+			WithField("module", modgenerativeanyscale.Name).
+			Debug("enabled module")
+	}
+
 	if _, ok := enabledModules[modtext2vecpalm.Name]; ok {
 		appState.Modules.Register(modtext2vecpalm.New())
 		appState.Logger.
 			WithField("action", "startup").
 			WithField("module", modtext2vecpalm.Name).
+			Debug("enabled module")
+	}
+
+	if _, ok := enabledModules[modtext2vecaws.Name]; ok {
+		appState.Modules.Register(modtext2vecaws.New())
+		appState.Logger.
+			WithField("action", "startup").
+			WithField("module", modtext2vecaws.Name).
 			Debug("enabled module")
 	}
 
@@ -738,11 +843,27 @@ func registerModules(appState *state.State) error {
 			Debug("enabled module")
 	}
 
+	if _, ok := enabledModules[modvoyageai.Name]; ok {
+		appState.Modules.Register(modvoyageai.New())
+		appState.Logger.
+			WithField("action", "startup").
+			WithField("module", modvoyageai.Name).
+			Debug("enabled module")
+	}
+
 	if _, ok := enabledModules[modbind.Name]; ok {
 		appState.Modules.Register(modbind.New())
 		appState.Logger.
 			WithField("action", "startup").
 			WithField("module", modbind.Name).
+			Debug("enabled module")
+	}
+
+	if _, ok := enabledModules[modjinaai.Name]; ok {
+		appState.Modules.Register(modjinaai.New())
+		appState.Logger.
+			WithField("action", "startup").
+			WithField("module", modjinaai.Name).
 			Debug("enabled module")
 	}
 
@@ -808,10 +929,15 @@ func reasonableHttpClient(authConfig cluster.AuthConfig) *http.Client {
 	return &http.Client{Transport: t}
 }
 
-func setupGoProfiling(config config.Config) {
-	go func() {
-		fmt.Println(http.ListenAndServe(":6060", nil))
-	}()
+func setupGoProfiling(config config.Config, logger logrus.FieldLogger) {
+	enterrors.GoWrapper(func() {
+		portNumber := config.Profiling.Port
+		if portNumber == 0 {
+			fmt.Println(http.ListenAndServe(":6060", nil))
+		} else {
+			http.ListenAndServe(fmt.Sprintf(":%d", portNumber), nil)
+		}
+	}, logger)
 
 	if config.Profiling.BlockProfileRate > 0 {
 		goruntime.SetBlockProfileRate(config.Profiling.BlockProfileRate)
@@ -835,4 +961,45 @@ func parseVersionFromSwaggerSpec() string {
 	}
 
 	return spec.Info.Version
+}
+
+func limitResources(appState *state.State) {
+	if os.Getenv("LIMIT_RESOURCES") == "true" {
+		appState.Logger.Info("Limiting resources:  memory: 80%, cores: all but one")
+		if os.Getenv("GOMAXPROCS") == "" {
+			// Fetch the number of cores from the cgroups cpuset
+			// and parse it into an int
+			cores, err := getCores()
+			if err == nil {
+				appState.Logger.WithField("cores", cores).
+					Warn("GOMAXPROCS not set, and unable to read from cgroups, setting to number of cores")
+				goruntime.GOMAXPROCS(cores)
+			} else {
+				cores = goruntime.NumCPU() - 1
+				if cores > 0 {
+					appState.Logger.WithField("cores", cores).
+						Warnf("Unable to read from cgroups: %v, setting to max cores to: %v", err, cores)
+					goruntime.GOMAXPROCS(cores)
+				}
+			}
+		}
+
+		limit, err := memlimit.SetGoMemLimit(0.8)
+		if err != nil {
+			appState.Logger.WithError(err).Warnf("Unable to set memory limit from cgroups: %v", err)
+			// Set memory limit to 90% of the available memory
+			limit := int64(float64(memory.TotalMemory()) * 0.8)
+			debug.SetMemoryLimit(limit)
+			appState.Logger.WithField("limit", limit).Info("Set memory limit based on available memory")
+		} else {
+			appState.Logger.WithField("limit", limit).Info("Set memory limit")
+		}
+	} else {
+		appState.Logger.Info("No resource limits set, weaviate will use all available memory and CPU. " +
+			"To limit resources, set LIMIT_RESOURCES=true")
+	}
+}
+
+func telemetryEnabled(state *state.State) bool {
+	return !state.ServerConfig.Config.DisableTelemetry
 }

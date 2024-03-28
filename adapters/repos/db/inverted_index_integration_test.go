@@ -4,7 +4,7 @@
 //  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
 //   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
 //
-//  Copyright © 2016 - 2023 Weaviate B.V. All rights reserved.
+//  Copyright © 2016 - 2024 Weaviate B.V. All rights reserved.
 //
 //  CONTACT: hello@weaviate.io
 //
@@ -79,7 +79,7 @@ func TestIndexByTimestampsNullStatePropLength_AddClass(t *testing.T) {
 		},
 	}}
 	repo, err := New(logger, Config{
-		MemtablesFlushIdleAfter:   60,
+		MemtablesFlushDirtyAfter:  60,
 		RootPath:                  dirName,
 		QueryMaximumResults:       10000,
 		MaxImportGoroutinesFactor: 1,
@@ -114,11 +114,11 @@ func TestIndexByTimestampsNullStatePropLength_AddClass(t *testing.T) {
 
 	t.Run("check for additional buckets", func(t *testing.T) {
 		for _, idx := range migrator.db.indices {
-			idx.ForEachShard(func(_ string, shd *Shard) error {
-				createBucket := shd.store.Bucket("property__creationTimeUnix")
+			idx.ForEachShard(func(_ string, shd ShardLike) error {
+				createBucket := shd.Store().Bucket("property__creationTimeUnix")
 				assert.NotNil(t, createBucket)
 
-				updateBucket := shd.store.Bucket("property__lastUpdateTimeUnix")
+				updateBucket := shd.Store().Bucket("property__lastUpdateTimeUnix")
 				assert.NotNil(t, updateBucket)
 
 				cases := []struct {
@@ -133,8 +133,8 @@ func TestIndexByTimestampsNullStatePropLength_AddClass(t *testing.T) {
 					{prop: "updateWithoutII", compareFunc: assert.Nil},
 				}
 				for _, tt := range cases {
-					tt.compareFunc(t, shd.store.Bucket("property_"+tt.prop+filters.InternalNullIndex))
-					tt.compareFunc(t, shd.store.Bucket("property_"+tt.prop+filters.InternalPropertyLength))
+					tt.compareFunc(t, shd.Store().Bucket("property_"+tt.prop+filters.InternalNullIndex))
+					tt.compareFunc(t, shd.Store().Bucket("property_"+tt.prop+filters.InternalPropertyLength))
 				}
 				return nil
 			})
@@ -149,7 +149,7 @@ func TestIndexByTimestampsNullStatePropLength_AddClass(t *testing.T) {
 			Properties: map[string]interface{}{"initialWithIINil": "0", "initialWithIITrue": "0", "initialWithoutII": "1", "updateWithIINil": "2", "updateWithIITrue": "2", "updateWithoutII": "3"},
 		}
 		vec := []float32{1, 2, 3}
-		require.Nil(t, repo.PutObject(context.Background(), objWithProperty, vec, nil))
+		require.Nil(t, repo.PutObject(context.Background(), objWithProperty, vec, nil, nil))
 
 		testID2 := strfmt.UUID("a0b55b05-bc5b-4cc9-b646-1452d1390a63")
 		objWithoutProperty := &models.Object{
@@ -157,7 +157,7 @@ func TestIndexByTimestampsNullStatePropLength_AddClass(t *testing.T) {
 			Class:      "TestClass",
 			Properties: map[string]interface{}{},
 		}
-		require.Nil(t, repo.PutObject(context.Background(), objWithoutProperty, vec, nil))
+		require.Nil(t, repo.PutObject(context.Background(), objWithoutProperty, vec, nil, nil))
 
 		testID3 := strfmt.UUID("a0b55b05-bc5b-4cc9-b646-1452d1390a64")
 		objWithNilProperty := &models.Object{
@@ -165,16 +165,16 @@ func TestIndexByTimestampsNullStatePropLength_AddClass(t *testing.T) {
 			Class:      "TestClass",
 			Properties: map[string]interface{}{"initialWithIINil": nil, "initialWithIITrue": nil, "initialWithoutII": nil, "updateWithIINil": nil, "updateWithIITrue": nil, "updateWithoutII": nil},
 		}
-		require.Nil(t, repo.PutObject(context.Background(), objWithNilProperty, vec, nil))
+		require.Nil(t, repo.PutObject(context.Background(), objWithNilProperty, vec, nil, nil))
 	})
 
 	t.Run("delete class", func(t *testing.T) {
 		require.Nil(t, migrator.DropClass(context.Background(), class.Class))
 		for _, idx := range migrator.db.indices {
-			idx.ForEachShard(func(name string, shd *Shard) error {
-				require.Nil(t, shd.store.Bucket("property__creationTimeUnix"))
-				require.Nil(t, shd.store.Bucket("property_name"+filters.InternalNullIndex))
-				require.Nil(t, shd.store.Bucket("property_name"+filters.InternalPropertyLength))
+			idx.ForEachShard(func(name string, shd ShardLike) error {
+				require.Nil(t, shd.Store().Bucket("property__creationTimeUnix"))
+				require.Nil(t, shd.Store().Bucket("property_name"+filters.InternalNullIndex))
+				require.Nil(t, shd.Store().Bucket("property_name"+filters.InternalPropertyLength))
 				return nil
 			})
 		}
@@ -201,7 +201,7 @@ func TestIndexNullState_GetClass(t *testing.T) {
 		}
 		var err error
 		repo, err = New(logrus.New(), Config{
-			MemtablesFlushIdleAfter:   60,
+			MemtablesFlushDirtyAfter:  60,
 			RootPath:                  dirName,
 			QueryMaximumResults:       10000,
 			MaxImportGoroutinesFactor: 1,
@@ -301,7 +301,7 @@ func TestIndexNullState_GetClass(t *testing.T) {
 				},
 			},
 		} {
-			err := repo.PutObject(context.Background(), obj, vec, nil)
+			err := repo.PutObject(context.Background(), obj, vec, nil, nil)
 			require.Nil(t, err)
 		}
 	})
@@ -309,8 +309,8 @@ func TestIndexNullState_GetClass(t *testing.T) {
 	t.Run("check buckets exist", func(t *testing.T) {
 		index := repo.indices["testclass"]
 		n := 0
-		index.ForEachShard(func(_ string, shard *Shard) error {
-			bucketNull := shard.store.Bucket(helpers.BucketFromPropNameNullLSM("name"))
+		index.ForEachShard(func(_ string, shard ShardLike) error {
+			bucketNull := shard.Store().Bucket(helpers.BucketFromPropNameNullLSM("name"))
 			require.NotNil(t, bucketNull)
 			n++
 			return nil
@@ -467,7 +467,7 @@ func TestIndexPropLength_GetClass(t *testing.T) {
 		}
 		var err error
 		repo, err = New(logrus.New(), Config{
-			MemtablesFlushIdleAfter:   60,
+			MemtablesFlushDirtyAfter:  60,
 			RootPath:                  dirName,
 			QueryMaximumResults:       10000,
 			MaxImportGoroutinesFactor: 1,
@@ -571,7 +571,7 @@ func TestIndexPropLength_GetClass(t *testing.T) {
 				},
 			},
 		} {
-			err := repo.PutObject(context.Background(), obj, vec, nil)
+			err := repo.PutObject(context.Background(), obj, vec, nil, nil)
 			require.Nil(t, err)
 		}
 	})
@@ -579,10 +579,10 @@ func TestIndexPropLength_GetClass(t *testing.T) {
 	t.Run("check buckets exist", func(t *testing.T) {
 		index := repo.indices["testclass"]
 		n := 0
-		index.ForEachShard(func(_ string, shard *Shard) error {
-			bucketPropLengthName := shard.store.Bucket(helpers.BucketFromPropNameLengthLSM("name"))
+		index.ForEachShard(func(_ string, shard ShardLike) error {
+			bucketPropLengthName := shard.Store().Bucket(helpers.BucketFromPropNameLengthLSM("name"))
 			require.NotNil(t, bucketPropLengthName)
-			bucketPropLengthIntArray := shard.store.Bucket(helpers.BucketFromPropNameLengthLSM("int_array"))
+			bucketPropLengthIntArray := shard.Store().Bucket(helpers.BucketFromPropNameLengthLSM("int_array"))
 			require.NotNil(t, bucketPropLengthIntArray)
 			n++
 			return nil
@@ -820,7 +820,7 @@ func TestIndexByTimestamps_GetClass(t *testing.T) {
 		}
 		var err error
 		repo, err = New(logrus.New(), Config{
-			MemtablesFlushIdleAfter:   60,
+			MemtablesFlushDirtyAfter:  60,
 			RootPath:                  dirName,
 			QueryMaximumResults:       10000,
 			MaxImportGoroutinesFactor: 1,
@@ -923,7 +923,7 @@ func TestIndexByTimestamps_GetClass(t *testing.T) {
 				},
 			},
 		} {
-			err := repo.PutObject(context.Background(), obj, vec, nil)
+			err := repo.PutObject(context.Background(), obj, vec, nil, nil)
 			require.Nil(t, err)
 		}
 	})
@@ -931,10 +931,10 @@ func TestIndexByTimestamps_GetClass(t *testing.T) {
 	t.Run("check buckets exist", func(t *testing.T) {
 		index := repo.indices["testclass"]
 		n := 0
-		index.ForEachShard(func(_ string, shard *Shard) error {
-			bucketCreated := shard.store.Bucket("property_" + filters.InternalPropCreationTimeUnix)
+		index.ForEachShard(func(_ string, shard ShardLike) error {
+			bucketCreated := shard.Store().Bucket("property_" + filters.InternalPropCreationTimeUnix)
 			require.NotNil(t, bucketCreated)
-			bucketUpdated := shard.store.Bucket("property_" + filters.InternalPropLastUpdateTimeUnix)
+			bucketUpdated := shard.Store().Bucket("property_" + filters.InternalPropLastUpdateTimeUnix)
 			require.NotNil(t, bucketUpdated)
 			n++
 			return nil

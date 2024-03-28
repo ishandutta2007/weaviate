@@ -4,7 +4,7 @@
 //  \ V  V /  __/ (_| |\ V /| | (_| | ||  __/
 //   \_/\_/ \___|\__,_| \_/ |_|\__,_|\__\___|
 //
-//  Copyright © 2016 - 2023 Weaviate B.V. All rights reserved.
+//  Copyright © 2016 - 2024 Weaviate B.V. All rights reserved.
 //
 //  CONTACT: hello@weaviate.io
 //
@@ -15,22 +15,32 @@ import (
 	"context"
 
 	"github.com/pkg/errors"
+	"github.com/weaviate/weaviate/entities/moduletools"
 	"github.com/weaviate/weaviate/modules/text2vec-transformers/ent"
+	libvectorizer "github.com/weaviate/weaviate/usecases/vectorizer"
 )
 
 func (v *Vectorizer) Texts(ctx context.Context, inputs []string,
-	settings ClassSettings,
+	cfg moduletools.ClassConfig,
 ) ([]float32, error) {
 	vectors := make([][]float32, len(inputs))
 	for i := range inputs {
-		res, err := v.client.VectorizeQuery(ctx, inputs[i], ent.VectorizationConfig{
-			PoolingStrategy: settings.PoolingStrategy(),
-		})
+		res, err := v.client.VectorizeQuery(ctx, inputs[i], v.getVectorizationConfig(cfg))
 		if err != nil {
 			return nil, errors.Wrap(err, "remote client vectorize")
 		}
 		vectors[i] = res.Vector
 	}
 
-	return v.CombineVectors(vectors), nil
+	return libvectorizer.CombineVectors(vectors), nil
+}
+
+func (v *Vectorizer) getVectorizationConfig(cfg moduletools.ClassConfig) ent.VectorizationConfig {
+	settings := NewClassSettings(cfg)
+	return ent.VectorizationConfig{
+		PoolingStrategy:     settings.PoolingStrategy(),
+		InferenceURL:        settings.InferenceURL(),
+		PassageInferenceURL: settings.PassageInferenceURL(),
+		QueryInferenceURL:   settings.QueryInferenceURL(),
+	}
 }
